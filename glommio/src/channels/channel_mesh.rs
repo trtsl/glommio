@@ -100,6 +100,24 @@ impl<T: Send> Senders<T> {
             sender.close();
         }
     }
+
+    /// Close a specific sender
+    pub(crate) fn close_id(&self, idx: usize) {
+        if let Some(s) = self.get(idx) {
+            s.close()
+        }
+    }
+
+    pub(crate) fn executor_id(&self, idx: usize) -> Option<usize> {
+        self.get(idx).map(|s| s.notifier_id())
+    }
+
+    pub(crate) fn get(&self, idx: usize) -> Option<&ConnectedSender<T>> {
+        match self.senders.get(idx) {
+            Some(Some(s)) => Some(s),
+            None | Some(None) => None,
+        }
+    }
 }
 
 /// Receiver side

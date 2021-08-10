@@ -328,6 +328,10 @@ impl<T: Send + Sized> ConnectedSender<T> {
             }
         }
     }
+
+    pub(crate) fn notifier_id(&self) -> usize {
+        self.notifier.id()
+    }
 }
 
 impl<T: 'static + Send + Sized> SharedReceiver<T> {

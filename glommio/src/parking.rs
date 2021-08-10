@@ -344,7 +344,7 @@ impl Reactor {
 
     pub(crate) fn wake_wakers(&self, id: u64) {
         if let Some(wakers) = self.shared_channels.borrow_mut().wakers_map.get(&id) {
-            wakers.iter().for_each(|w| {
+            wakers.0.iter().for_each(|w| {
                 wake_by_ref!(w);
             })
         };

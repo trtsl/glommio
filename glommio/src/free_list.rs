@@ -79,6 +79,14 @@ impl<T> FreeList<T> {
             Slot::Free { .. } => unreachable!(),
         }
     }
+
+    /// rudimentary iteration over a `FreeList`
+    pub(crate) fn find_for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        self.slots.iter_mut().for_each(|s| match s {
+            Slot::Full { item } => f(item),
+            Slot::Free { .. } => {}
+        })
+    }
 }
 
 impl<T> ops::Index<Idx<T>> for FreeList<T> {

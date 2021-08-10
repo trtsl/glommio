@@ -57,3 +57,7 @@ path = "hyper.rs"
 [[example]]
 name = "gate"
 path = "gate.rs"
+
+[[example]]
+name = "remote_call"
+path = "../glommio/benches/remote_call.rs"

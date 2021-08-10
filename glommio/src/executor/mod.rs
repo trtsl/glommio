@@ -32,9 +32,11 @@
 mod latch;
 mod multitask;
 mod placement;
+mod remote_call;
 
 use latch::{Latch, LatchState};
 pub use placement::{CpuSet, Placement};
+pub use remote_call::RemoteCall;
 use tracing::trace;
 
 use std::{
@@ -55,6 +57,7 @@ use futures_lite::pin;
 use scoped_tls::scoped_thread_local;
 
 use crate::{
+    channels::channel_mesh::FullMesh,
     error::BuilderErrorKind,
     parking,
     sys,
@@ -576,6 +579,28 @@ impl Default for LocalExecutorBuilder {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Settings used in [`LocalExecutorPoolBuilder::channel_mesh`].
+pub struct MeshSettings {
+    /// The size of the channel used to send requests to execute futures on
+    /// other [`LocalExecutor`]s via a [`RemoteCall`].
+    pub request_channel_size: usize,
+    /// The size of the channel used to receive the output of [`RemoteCall`]s.
+    /// This only applies to `RemoteCall`s that require a response.
+    pub response_channel_size: usize,
+    /// The number of [`RemoteCall`] requests a [`LocalExecutor`] will address
+    /// concurrently from each remote [`LocalExecutor`].  Specifying `0`
+    /// implies that there is no limit to concurrency.
+    pub concurrency_limit: usize,
+}
+
+// Appeasing clippy's type_complexity lint
+type Meshes = (
+    FullMesh<remote_call::MsgDownstream>,
+    FullMesh<remote_call::MsgUpstream>,
+    MeshSettings,
+);
+
 /// A factory to configure and create a pool of [`LocalExecutor`]s.
 ///
 /// Configuration methods apply their settings to all [`LocalExecutor`]s in the
@@ -617,6 +642,7 @@ pub struct LocalExecutorPoolBuilder {
     preempt_timer_duration: Duration,
     /// Indicates a policy by which [`LocalExecutor`]s are bound to CPUs.
     placement: Placement,
+    mesh_settings: Option<MeshSettings>,
 }
 
 impl LocalExecutorPoolBuilder {
@@ -632,6 +658,7 @@ impl LocalExecutorPoolBuilder {
             io_memory: 10 << 20,
             preempt_timer_duration: Duration::from_millis(100),
             placement: Placement::Unbound,
+            mesh_settings: None,
         }
     }
 
@@ -675,6 +702,13 @@ impl LocalExecutorPoolBuilder {
         self
     }
 
+    /// Enable sending [`RemoteCall`]s via a
+    /// [`channel_mesh`](crate::channels::channel_mesh).
+    pub fn channel_mesh(mut self, settings: MeshSettings) -> LocalExecutorPoolBuilder {
+        self.mesh_settings = Some(settings);
+        self
+    }
+
     /// Spawn a pool of [`LocalExecutor`]s in a new thread according to the
     /// [`Placement`] policy, which is `Unbound` by default.
     ///
@@ -700,9 +734,22 @@ impl LocalExecutorPoolBuilder {
         let placement = std::mem::take(&mut self.placement);
         let mut cpu_set_gen = placement::CpuSetGenerator::new(placement, self.nr_shards)?;
         let latch = Latch::new(self.nr_shards);
+        let meshes = self.mesh_settings.clone().map(|settings| {
+            (
+                FullMesh::<remote_call::MsgDownstream>::full(
+                    self.nr_shards,
+                    settings.request_channel_size,
+                ),
+                FullMesh::<remote_call::MsgUpstream>::full(
+                    self.nr_shards,
+                    settings.response_channel_size,
+                ),
+                settings,
+            )
+        });
 
         for _ in 0..self.nr_shards {
-            match self.spawn_thread(&mut cpu_set_gen, &latch, fut_gen.clone()) {
+            match self.spawn_thread(&mut cpu_set_gen, meshes.clone(), &latch, fut_gen.clone()) {
                 Ok(handle) => handles.push(handle),
                 Err(err) => {
                     handles.join_all();
@@ -718,6 +765,7 @@ impl LocalExecutorPoolBuilder {
     fn spawn_thread<G, F, T>(
         &self,
         cpu_set_gen: &mut placement::CpuSetGenerator,
+        meshes: Option<Meshes>,
         latch: &Latch,
         fut_gen: G,
     ) -> Result<JoinHandle<Result<T>>>
@@ -750,7 +798,7 @@ impl LocalExecutorPoolBuilder {
                     )
                     .unwrap();
                     le.init();
-                    le.run(async move { Ok(fut_gen().await) })
+                    Ok(le.run(Self::run_with_mesh(fut_gen, meshes)))
                 } else {
                     // this `Err` isn't visible to the user; the pool builder directly returns an
                     // `Err` from the `std::thread::Builder`
@@ -762,7 +810,7 @@ impl LocalExecutorPoolBuilder {
         match handle {
             Ok(h) => Ok(h),
             Err(e) => {
-                // The `std::thread::Builder` was unable to spawn the thread and retuned an
+                // The `std::thread::Builder` was unable to spawn the thread and returned an
                 // `Err`, so we notify other threads to let them know they
                 // should not proceed with constructing their `LocalExecutor`s
                 latch.cancel().expect("unreachable: latch was ready");
@@ -771,11 +819,56 @@ impl LocalExecutorPoolBuilder {
             }
         }
     }
+
+    async fn run_with_mesh<G, F, T>(fut_gen: G, meshes: Option<Meshes>) -> T
+    where
+        G: FnOnce() -> F + Clone + Send + 'static,
+        F: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let mut handles = None;
+        if let Some((request_builder, response_builder, settings)) = meshes {
+            let (request_tx, request_rx) = request_builder.join().await.unwrap();
+            let (response_tx, response_rx) = response_builder.join().await.unwrap();
+            remote_call::Registry::set_tls(request_tx);
+            handles = Some(match "for_each" {
+                "for_each" => remote_call::Registry::process_inbound(
+                    request_rx,
+                    response_tx,
+                    response_rx,
+                    settings.concurrency_limit,
+                ),
+                "submit_all" => remote_call::Registry::process_inbound_select_all(
+                    request_rx,
+                    response_tx,
+                    response_rx,
+                    settings.concurrency_limit,
+                ),
+                _ => unreachable!(),
+            });
+        }
+        let res = fut_gen().await;
+        if let Some(hs) = handles {
+            // the shut down sequence is as follows:
+            // 1. at this point, the local executor's main task is done and it is only
+            //    addressing outstanding requests from other executors
+            // 2. we close `request_tx`, which causes `request_rx` `Stream`s to return
+            //    `Poll::Rendy(None)`
+            // 3. once `request_rx` are closed, we close `response_tx`
+            remote_call::Registry::close_request_tx().await;
+            for h in hs {
+                h.await;
+            }
+            remote_call::Registry::destroy();
+        }
+        res
+    }
 }
 
 /// Holds a collection of [`JoinHandle`]s.
 ///
 /// This struct is returned by [`LocalExecutorPoolBuilder::on_all_shards`].
+#[must_use = "You may need to call `PoolThreadHandles::join_all()` to keep the main thread alive"]
 #[derive(Debug)]
 pub struct PoolThreadHandles<T> {
     handles: Vec<JoinHandle<Result<T>>>,
@@ -1362,15 +1455,14 @@ impl<T> Task<T> {
     // 0:    50                      push   %rax
     // 1:    ff 15 00 00 00 00       callq  *0x0(%rip)
     // 7:    48 85 c0                test   %rax,%rax
-    // a:    74 17                   je     23  <== will call into the
-    // initialization routine c:    48 8b 88 38 03 00 00    mov
-    // 0x338(%rax),%rcx <== address of the head 13:   48 8b 80 40 03 00 00
-    // mov    0x340(%rax),%rax <== address of the tail 1a:   8b 00
-    // mov    (%rax),%eax 1c:   3b 01                   cmp    (%rcx),%eax <==
-    // need preempt 1e:   0f 95 c0                setne  %al
+    // a:    74 17                   je     23  <== will call into the initialization routine
+    // c:    48 8b 88 38 03 00 00    mov    0x338(%rax),%rcx <== address of the head
+    // 13:   48 8b 80 40 03 00 00    mov    0x340(%rax),%rax <== address of the tail
+    // 1a:   8b 00                   mov    (%rax),%eax
+    // 1c:   3b 01                   cmp    (%rcx),%eax <== need preempt
+    // 1e:   0f 95 c0                setne  %al
     // 21:   59                      pop    %rcx
-    // 22:   c3                      retq
-    // 23    <== initialization stuff
+    // 22:   c3                      retq   23    <== initialization stuff
     //
     // Rust has a thread local feature that is under experimental so we can maybe
     // switch to that someday.
@@ -2999,6 +3091,7 @@ mod test {
         let placement = std::mem::take(&mut builder.placement);
         let mut cpu_set_gen =
             placement::CpuSetGenerator::new(placement, builder.nr_shards).unwrap();
+        let mesh_builder = None;
         let latch = Latch::new(builder.nr_shards);
 
         let ii_cxl = 2;
@@ -3007,7 +3100,12 @@ mod test {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 assert!(ii_cxl <= latch.cancel().unwrap());
             }
-            match builder.spawn_thread(&mut cpu_set_gen, &latch, fut_gen.clone()) {
+            match builder.spawn_thread(
+                &mut cpu_set_gen,
+                mesh_builder.clone(),
+                &latch,
+                fut_gen.clone(),
+            ) {
                 Ok(handle) => handles.push(handle),
                 Err(_) => break,
             }

@@ -17,6 +17,7 @@ readme = "../README.md"
 log = "0.4"
 concurrent-queue = "1.1.2"
 futures-lite = "1.11.1"
+futures = "0.3.5"
 libc = "0.2.77"
 socket2 = { version = "0.3.18", features = ["unix", "reuseport"] }
 nix = "0.22.0"
@@ -38,6 +39,7 @@ membarrier = "0.2.2"
 itertools = "0.10.0"
 tracing = "0.1"
 crossbeam = "0.8"
+smallbox = { optional = true, git = "https://github.com/andylokandy/smallbox", rev = "60918766817ae8330f5fd56c1a68e21750c5336c" }
 
 [dev-dependencies]
 futures = "0.3.5"
@@ -95,7 +97,10 @@ required-features = ["bench"]
 name = "sharding"
 harness = false
 
-
 [[bench]]
 name = "spsc_queue"
+harness = false
+
+[[bench]]
+name = "remote_call"
 harness = false
