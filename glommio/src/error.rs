@@ -47,6 +47,25 @@ pub enum ResourceType<T> {
     Gate,
 }
 
+impl<T> ResourceType<T> {
+    /// A helper for mapping `ResourceType<T>` to `ResourceType<U>`
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ResourceType<U> {
+        match self {
+            Self::Semaphore {
+                requested,
+                available,
+            } => ResourceType::Semaphore {
+                requested,
+                available,
+            },
+            Self::RwLock => ResourceType::RwLock,
+            Self::Channel(t) => ResourceType::Channel(f(t)),
+            Self::File(s) => ResourceType::File(s),
+            Self::Gate => ResourceType::Gate,
+        }
+    }
+}
+
 /// Error variants for executor queues.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum QueueErrorKind {
@@ -337,6 +356,30 @@ impl<T> GlommioError<T> {
             index,
             kind: QueueErrorKind::NotFound,
         })
+    }
+
+    /// A helper for mapping `GlommioError<T>` to `GlommioError<U>`
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> GlommioError<U> {
+        match self {
+            Self::IoError(x) => GlommioError::IoError(x),
+            Self::EnhancedIoError {
+                source,
+                op,
+                path,
+                fd,
+            } => GlommioError::EnhancedIoError {
+                source,
+                op,
+                path,
+                fd,
+            },
+            Self::ExecutorError(x) => GlommioError::ExecutorError(x),
+            Self::BuilderError(x) => GlommioError::BuilderError(x),
+            Self::Closed(x) => GlommioError::Closed(x.map(f)),
+            Self::WouldBlock(x) => GlommioError::WouldBlock(x.map(f)),
+            Self::ReactorError(x) => GlommioError::ReactorError(x),
+            Self::TimedOut(x) => GlommioError::TimedOut(x),
+        }
     }
 }
 
