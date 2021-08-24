@@ -13,7 +13,6 @@ pretty-bytes = "0.2.2"
 clap = "2.33"
 sys-info = "0.7.0"
 fastrand = "1.4.0"
-num_cpus = "1.13.0"
 
 # hyper and tokio for the hyper example. We just need the traits from Tokio
 hyper = { version = "0.14", features = ["full"] }

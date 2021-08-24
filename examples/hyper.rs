@@ -128,8 +128,9 @@ fn main() {
 
     println!("Starting server on port 8000");
 
-    LocalExecutorPoolBuilder::new(num_cpus::get())
-        .placement(Placement::MaxSpread(CpuSet::online().ok()))
+    let cpus_online = CpuSet::online().expect("use Placement::Unbound instead");
+    LocalExecutorPoolBuilder::new(cpus_online.len())
+        .placement(Placement::MaxSpread(Some(cpus_online)))
         .on_all_shards(|| async move {
             let id = Local::id();
             println!("Starting executor {}", id);
